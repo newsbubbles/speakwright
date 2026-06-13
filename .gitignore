@@ -1,0 +1,11 @@
+# Python venv (recreate from requirements.txt)
+.venv/
+__pycache__/
+*.pyc
+
+# Local secrets
+.env
+
+# Generated audio / caches
+voice_messages/
+*.wav
