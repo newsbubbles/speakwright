@@ -13,6 +13,7 @@ Also keeps the legacy /transcribe and /tts for backward compat.
 """
 import asyncio
 import io
+import json
 import logging
 import os
 import re
@@ -23,7 +24,7 @@ from typing import Optional
 
 import numpy as np
 import soundfile as sf
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import Response
 from pydantic import BaseModel
 
@@ -33,6 +34,24 @@ logger = logging.getLogger("voice-sidecar")
 PORT = int(os.getenv("VOICE_PORT", "8765"))
 WHISPER_MODEL_SIZE = os.getenv("WHISPER_MODEL_SIZE", "base")
 WHISPER_DEVICE = os.getenv("WHISPER_DEVICE", "cpu").lower()
+WHISPER_LANG = os.getenv("WHISPER_LANG", "en")   # empty = detect
+WHISPER_COMPUTE = os.getenv("WHISPER_COMPUTE", "")   # force a CTranslate2 compute type
+
+# The ear: a hot mic stream with a wake word and VAD end-pointing. Time is
+# audio time (frames counted), never the wall clock, so a test can stream
+# faster than real time and behave the same.
+EAR_SR = 16000
+EAR_FRAME = 1280                                        # 80 ms, openWakeWord's frame
+WAKE_MODEL = os.getenv("WAKE_MODEL", "hey_jarvis")
+WAKE_THRESHOLD = float(os.getenv("WAKE_THRESHOLD", "0.5"))
+VAD_THRESHOLD = float(os.getenv("VAD_THRESHOLD", "0.5"))
+END_SILENCE_S = float(os.getenv("END_SILENCE_S", "0.7"))
+WAKE_PATIENCE_S = 3.0                                   # wake word, then nothing: forget it
+MAX_UTTERANCE_S = 20.0
+PREROLL_FRAMES = 6                                      # ~0.5 s kept before speech is noticed
+NO_SPEECH_MAX = float(os.getenv("NO_SPEECH_MAX", "0.6"))
+LOGPROB_MIN = float(os.getenv("LOGPROB_MIN", "-1.0"))
+WAKE_STRIP = re.compile(r"^\W*(hey|hi|ok|okay)?\W*jarvis\W*", re.I)
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
 KOKORO_LANG = os.getenv("KOKORO_LANG", "a")
 KOKORO_SR = 24000
@@ -63,10 +82,16 @@ async def get_whisper():
         def _load():
             from faster_whisper import WhisperModel
             if WHISPER_DEVICE == "cuda":
-                try:
-                    return WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type="float16")
-                except Exception as e:  # noqa: BLE001
-                    logger.warning("[WHISPER] CUDA failed (%s), CPU fallback", e)
+                # Pascal cards (GTX 10xx) have no fast float16 and CTranslate2
+                # refuses it; float32 on the GPU still beats int8 on the CPU
+                for ct in [c for c in (WHISPER_COMPUTE, "float16", "float32") if c]:
+                    try:
+                        m = WhisperModel(WHISPER_MODEL_SIZE, device="cuda", compute_type=ct)
+                        logger.info("[WHISPER] cuda %s", ct)
+                        return m
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning("[WHISPER] cuda %s failed (%s)", ct, e)
+                logger.warning("[WHISPER] CPU fallback")
             return WhisperModel(WHISPER_MODEL_SIZE, device="cpu", compute_type="int8")
 
         _whisper = await asyncio.get_event_loop().run_in_executor(None, _load)
@@ -204,7 +229,185 @@ async def _synth_wav(text: str, voice: Optional[str]) -> bytes:
     return await asyncio.get_event_loop().run_in_executor(None, _synth)
 
 
+# ---- the ear ------------------------------------------------------------------
+_ear_dl = False
+
+
+def _new_ear_models():
+    """Fresh wake word + VAD models: both keep streaming state, so one pair
+    per connection."""
+    global _ear_dl
+    import openwakeword
+    from openwakeword.model import Model
+    from openwakeword.vad import VAD
+    if not _ear_dl:
+        try:
+            openwakeword.utils.download_models(model_names=[WAKE_MODEL])
+        except Exception as e:  # noqa: BLE001
+            logger.warning("[EAR] model download skipped: %s", e)
+        _ear_dl = True
+    return Model(wakeword_models=[WAKE_MODEL], inference_framework="onnx"), VAD()
+
+
+class Ear:
+    """listening (wake word only) -> capturing (buffer until silence) ->
+    transcript; or open (follow-up window, no wake word needed) -> capturing."""
+
+    def __init__(self, oww, vad):
+        self.oww, self.vad = oww, vad
+        self.state = "listening"
+        self.t = 0.0
+        self.open_until = 0.0
+        self.muted = False
+        self.preroll = []
+        self.buf = []
+        self.capture_t0 = 0.0
+        self.last_speech = 0.0
+        self.speech_seen = False
+        self.source = "wake"
+
+    def open(self, seconds):
+        self.open_until = self.t + max(0.0, float(seconds))
+        if self.state == "listening":
+            self.state = "open"
+
+    def _start(self, source):
+        self.state = "capturing"
+        self.source = source
+        self.buf = list(self.preroll)
+        self.capture_t0 = self.t
+        self.last_speech = self.t
+        self.speech_seen = False
+
+    def _reset(self):
+        self.state = "open" if self.t < self.open_until else "listening"
+        self.buf = []
+        self.speech_seen = False
+
+    def feed(self, frame):
+        self.t += EAR_FRAME / EAR_SR
+        out = []
+        if self.muted:
+            return out
+        p = float(self.vad.predict(frame))   # __call__ only stores; predict returns the probability
+        if self.state == "capturing":
+            self.buf.append(frame)
+            if p > VAD_THRESHOLD:
+                self.last_speech = self.t
+                if not self.speech_seen:
+                    self.speech_seen = True
+                    out.append({"event": "speech_start"})
+            dur = self.t - self.capture_t0
+            if (self.speech_seen and self.t - self.last_speech > END_SILENCE_S) or dur > MAX_UTTERANCE_S:
+                out.append({"event": "speech_end", "seconds": round(dur, 2)})
+                out.append(("transcribe", np.concatenate(self.buf), self.source))
+                self._reset()
+                out.append({"event": "state", "state": self.state})
+            elif not self.speech_seen and dur > WAKE_PATIENCE_S:
+                out.append({"event": "cancel", "reason": "no speech after the wake word"})
+                self._reset()
+                out.append({"event": "state", "state": self.state})
+        elif self.state == "listening":
+            wake = float(self.oww.predict(frame)[WAKE_MODEL])
+            if wake > WAKE_THRESHOLD:
+                self.oww.reset()
+                self._start("wake")
+                out.append({"event": "wake", "score": round(wake, 2)})
+        else:  # open
+            if self.t > self.open_until:
+                self.state = "listening"
+                out.append({"event": "state", "state": "listening"})
+            elif p > VAD_THRESHOLD:
+                self._start("followup")
+                self.speech_seen = True
+                out.append({"event": "speech_start"})
+        self.preroll.append(frame)
+        del self.preroll[:-PREROLL_FRAMES]
+        return out
+
+
+async def _transcribe_pcm(pcm):
+    model = await get_whisper()
+    audio = pcm.astype(np.float32) / 32768.0
+
+    def _run():
+        segs, _info = model.transcribe(audio, beam_size=5, language=WHISPER_LANG or None)
+        segs = list(segs)
+        text = "".join(s.text for s in segs).strip()
+        nsp = max((s.no_speech_prob for s in segs), default=1.0)
+        lp = min((s.avg_logprob for s in segs), default=-10.0)
+        return text, float(nsp), float(lp)
+
+    return await asyncio.get_event_loop().run_in_executor(None, _run)
+
+
+async def _deliver_transcript(ws, pcm, source):
+    start = time.time()
+    try:
+        text, nsp, lp = await _transcribe_pcm(pcm)
+    except Exception as e:  # noqa: BLE001
+        logger.error("[EAR] transcription failed: %s", e)
+        await ws.send_json({"event": "error", "error": f"transcription failed: {e}"})
+        return
+    if source == "wake":
+        text = WAKE_STRIP.sub("", text, count=1).strip()
+    kept = bool(text) and nsp < NO_SPEECH_MAX and lp > LOGPROB_MIN
+    logger.info("[EAR] %s %dms nsp=%.2f lp=%.2f %s: %s", source, int((time.time() - start) * 1000), nsp, lp,
+                "kept" if kept else "dropped", text[:80])
+    await ws.send_json({"event": "transcript", "text": text, "source": source, "kept": kept,
+                        "no_speech_prob": round(nsp, 3), "avg_logprob": round(lp, 3),
+                        "seconds": round(len(pcm) / EAR_SR, 2)})
+
+
 app = FastAPI(title="Speakwright voice sidecar")
+
+
+@app.websocket("/v1/audio/stream")
+async def audio_stream(ws: WebSocket):
+    """Binary frames in: 16 kHz mono PCM16, any size (re-framed to 80 ms).
+    Text frames in: {"open": seconds} keeps the ear open without a wake word,
+    {"mute": bool} pauses it (while TTS plays). Events out as JSON."""
+    await ws.accept()
+    try:
+        oww, vad = await asyncio.get_event_loop().run_in_executor(None, _new_ear_models)
+    except Exception as e:  # noqa: BLE001
+        logger.error("[EAR] unavailable: %s", e)
+        await ws.send_json({"event": "error", "error": f"ear unavailable: {e}"})
+        await ws.close()
+        return
+    ear = Ear(oww, vad)
+    await ws.send_json({"event": "state", "state": "listening", "wake": WAKE_MODEL})
+    carry = b""
+    try:
+        while True:
+            msg = await ws.receive()
+            if msg.get("type") == "websocket.disconnect":
+                break
+            if msg.get("bytes") is not None:
+                data = carry + msg["bytes"]
+                n = len(data) // (EAR_FRAME * 2) * (EAR_FRAME * 2)
+                carry = data[n:]
+                if not n:
+                    continue
+                frames = np.frombuffer(data[:n], dtype=np.int16).reshape(-1, EAR_FRAME)
+                for fr in frames:
+                    for ev in ear.feed(fr):
+                        if isinstance(ev, tuple):
+                            asyncio.create_task(_deliver_transcript(ws, ev[1], ev[2]))
+                        else:
+                            await ws.send_json(ev)
+            elif msg.get("text"):
+                try:
+                    ctl = json.loads(msg["text"])
+                except ValueError:
+                    continue
+                if "open" in ctl:
+                    ear.open(ctl["open"])
+                    await ws.send_json({"event": "state", "state": ear.state})
+                if "mute" in ctl:
+                    ear.muted = bool(ctl["mute"])
+    except WebSocketDisconnect:
+        pass
 
 
 @app.get("/health")
