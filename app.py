@@ -53,6 +53,11 @@ NO_SPEECH_MAX = float(os.getenv("NO_SPEECH_MAX", "0.6"))
 LOGPROB_MIN = float(os.getenv("LOGPROB_MIN", "-1.0"))
 WAKE_STRIP = re.compile(r"^\W*(hey|hi|ok|okay)?\W*jarvis\W*", re.I)
 KOKORO_VOICE = os.getenv("KOKORO_VOICE", "af_heart")
+# Cloned voices live in clone.py (its own venv, port 8766): any voice with a
+# reference clip in voices/ goes there, Kokoro answers when it cannot.
+CLONE_URL = os.getenv("VOICE_CLONE_URL", "http://127.0.0.1:8766")
+VOICES_DIR = Path(__file__).parent / "voices"
+DEFAULT_VOICE = os.getenv("DEFAULT_VOICE", KOKORO_VOICE)
 KOKORO_LANG = os.getenv("KOKORO_LANG", "a")
 KOKORO_SR = 24000
 
@@ -210,9 +215,34 @@ async def _transcribe_bytes(content: bytes, filename: str) -> str:
                 pass
 
 
-async def _synth_wav(text: str, voice: Optional[str]) -> bytes:
+def _is_clone(voice: str) -> bool:
+    return bool(voice) and (VOICES_DIR / f"{voice}.wav").exists()
+
+
+async def _clone_wav(text: str, voice: str) -> Optional[bytes]:
+    """The cloned voice, or None when its sidecar is down or the GPU is busy."""
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=90) as c:
+            r = await c.post(CLONE_URL + "/v1/audio/speech", json={"input": text, "voice": voice})
+        if r.status_code == 200:
+            return r.content
+        logger.warning("[CLONE] %s: %s", r.status_code, r.text[:120])
+    except httpx.HTTPError as e:
+        logger.warning("[CLONE] unreachable: %s", e)
+    return None
+
+
+async def _synth_wav(text: str, voice: Optional[str]) -> tuple[bytes, str]:
+    """Returns the wav and the engine that made it ("clone" or "kokoro"),
+    so a caller can tell a fallback from the real thing."""
     clean = await voice_ready_text(text)
-    chosen = voice or KOKORO_VOICE
+    chosen = voice or DEFAULT_VOICE
+    if _is_clone(chosen):
+        wav = await _clone_wav(clean, chosen)
+        if wav is not None:
+            return wav, "clone"
+        chosen = KOKORO_VOICE          # the stock voice steps in, same words
     if not chosen or chosen in OPENAI_VOICES:
         chosen = KOKORO_VOICE
     pipeline = await get_kokoro()
@@ -226,7 +256,7 @@ async def _synth_wav(text: str, voice: Optional[str]) -> bytes:
         sf.write(buf, full, KOKORO_SR, format="WAV")
         return buf.getvalue()
 
-    return await asyncio.get_event_loop().run_in_executor(None, _synth)
+    return await asyncio.get_event_loop().run_in_executor(None, _synth), "kokoro"
 
 
 # ---- the ear ------------------------------------------------------------------
@@ -442,9 +472,9 @@ async def openai_speech(req: SpeechRequest):
         raise HTTPException(status_code=400, detail="input cannot be empty")
     start = time.time()
     try:
-        wav = await _synth_wav(req.input, req.voice)
-        logger.info("[TTS] %d bytes in %dms", len(wav), int((time.time() - start) * 1000))
-        return Response(content=wav, media_type="audio/wav")
+        wav, engine = await _synth_wav(req.input, req.voice)
+        logger.info("[TTS] %s: %d bytes in %dms", engine, len(wav), int((time.time() - start) * 1000))
+        return Response(content=wav, media_type="audio/wav", headers={"X-Voice-Engine": engine})
     except Exception as e:  # noqa: BLE001
         logger.error("[TTS] failed: %s", e, exc_info=True)
         raise HTTPException(status_code=500, detail=f"TTS failed: {e}")
@@ -466,8 +496,8 @@ async def tts(text: str = Form(...)):
     if not text.strip():
         raise HTTPException(status_code=400, detail="Text cannot be empty")
     try:
-        wav = await _synth_wav(text, None)
-        return Response(content=wav, media_type="audio/wav")
+        wav, engine = await _synth_wav(text, None)
+        return Response(content=wav, media_type="audio/wav", headers={"X-Voice-Engine": engine})
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"TTS failed: {e}")
 

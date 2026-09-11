@@ -2,9 +2,9 @@
 
 A small local voice sidecar. It does three things:
 
-1. **Ear-readiness rewrite** — an optional LLM pass that rewrites assistant text so it sounds natural read aloud: symbols become words, code blocks get a one-line spoken summary, lists turn into flowing sentences, markdown is dropped. This is the "make the speech right" step (and yes, the name is a pun on it).
-2. **Speech-to-text** — [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
-3. **Text-to-speech** — [Kokoro-82M](https://github.com/hexgrad/kokoro).
+1. **Ear-readiness rewrite**: an optional LLM pass that rewrites assistant text so it sounds natural read aloud: symbols become words, code blocks get a one-line spoken summary, lists turn into flowing sentences, markdown is dropped. This is the "make the speech right" step (and yes, the name is a pun on it).
+2. **Speech-to-text**: [faster-whisper](https://github.com/SYSTRAN/faster-whisper).
+3. **Text-to-speech**: [Kokoro-82M](https://github.com/hexgrad/kokoro), or your own voice cloned by [Chatterbox-Turbo](https://github.com/resemble-ai/chatterbox) from a short reference clip (see below).
 
 It speaks the **OpenAI audio API**, so any OpenAI-compatible client can point at it. It binds `127.0.0.1` only and needs no API key of its own.
 
@@ -36,14 +36,16 @@ For GPU TTS/STT, install a CUDA build of torch into the venv and set `WHISPER_DE
 
 ## Config
 
-All optional — see [`.env.example`](.env.example). Set via environment variables:
+All optional, see [`.env.example`](.env.example). Set via environment variables:
 
 | Var | Default | Purpose |
 |---|---|---|
 | `VOICE_PORT` | `8765` | Listen port |
 | `WHISPER_MODEL_SIZE` | `base` | `tiny`/`base`/`small`/`medium`/`large-v3` |
 | `WHISPER_DEVICE` | `cpu` | `cpu` (int8) or `cuda` (float16) |
-| `KOKORO_VOICE` | `af_heart` | Kokoro voice |
+| `KOKORO_VOICE` | `af_heart` | Kokoro voice, and the fallback when a cloned voice cannot speak |
+| `DEFAULT_VOICE` | `KOKORO_VOICE` | Voice used when a request names none; set it to a clip name to speak in that voice |
+| `VOICE_CLONE_URL` | `http://127.0.0.1:8766` | Where clone.py listens |
 | `KOKORO_LANG` | `a` | Kokoro language code |
 | `KOKORO_DEVICE` | auto | Force `cuda`/`cpu` |
 | `VOICE_AGENT_MODEL` | _(unset)_ | Enables the ear-readiness rewrite when set with a key |
@@ -51,3 +53,24 @@ All optional — see [`.env.example`](.env.example). Set via environment variabl
 | `VOICE_AGENT_API_KEY` | _(unset)_ | Key for the rewrite model |
 
 Without `VOICE_AGENT_MODEL` + `VOICE_AGENT_API_KEY`, TTS still works using a regex baseline cleanup instead of the LLM rewrite.
+
+## Your own voice
+
+Drop a reference clip at `voices/<name>.wav` (10 to 20 seconds of one person talking, mono, no music) and any request with `voice: "<name>"` is synthesized in that voice. The cloning model needs an older torch than the rest of the sidecar, so it runs as a second process from its own venv:
+
+```bash
+uv venv --python 3.11 .venv-clone
+uv pip install --python .venv-clone --index-url https://download.pytorch.org/whl/cu126 "torch==2.6.0" "torchaudio==2.6.0"
+uv pip install --python .venv-clone -r requirements-clone.txt
+.venv-clone/Scripts/python clone.py            # 127.0.0.1:8766
+```
+
+The first request downloads Chatterbox-Turbo (about 2 GB) into `.hf/` next to the script and loads it. `DEFAULT_VOICE=<name>` makes the clone the voice of every request that does not name one. When clone.py is down, or the GPU is busy with a render and there is no room for the model, the same words come out in the Kokoro voice instead, so speech never fails because the clone could not run. Reference clips and the weights are git-ignored: a voice print stays on the machine it was recorded on.
+
+| Var | Default | Purpose |
+|---|---|---|
+| `CLONE_PORT` | `8766` | Listen port |
+| `CLONE_DEVICE` | `cuda` | `cuda` or `cpu` (slow) |
+| `CLONE_DEFAULT` | `nate` | Clip used when a request names no voice |
+| `CLONE_MIN_FREE_GB` | `1.2` | Below this much free VRAM the clone refuses and Kokoro speaks |
+| `HF_HOME` | `.hf/` | Where the weights download |
