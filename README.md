@@ -34,6 +34,12 @@ For GPU TTS/STT, install a CUDA build of torch into the venv and set `WHISPER_DE
 .venv/Scripts/python -m uvicorn app:app --host 127.0.0.1 --port 8765
 ```
 
+On Windows, `start-voice.ps1` starts speakwright and the cloned voice detached with the GPU settings, and leaves alone whatever is already listening:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File start-voice.ps1
+```
+
 ## Config
 
 All optional, see [`.env.example`](.env.example). Set via environment variables:
