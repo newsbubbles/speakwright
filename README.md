@@ -47,6 +47,7 @@ All optional, see [`.env.example`](.env.example). Set via environment variables:
 | Var | Default | Purpose |
 |---|---|---|
 | `VOICE_PORT` | `8765` | Listen port |
+| `VOICE_WARM` | `1` | Load whisper, Kokoro and the clone at startup instead of on the first request |
 | `WHISPER_MODEL_SIZE` | `base` | `tiny`/`base`/`small`/`medium`/`large-v3` |
 | `WHISPER_DEVICE` | `cpu` | `cpu` (int8) or `cuda` (float16) |
 | `KOKORO_VOICE` | `af_heart` | Kokoro voice, and the fallback when a cloned voice cannot speak |

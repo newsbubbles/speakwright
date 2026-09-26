@@ -392,6 +392,30 @@ async def _deliver_transcript(ws, pcm, source):
 app = FastAPI(title="Speakwright voice sidecar")
 
 
+@app.on_event("startup")
+async def _warm():
+    """Load the models now rather than on the first word: cold, the first
+    transcription took 25 s and the first stock-voice line three minutes on
+    the shared GPU. VOICE_WARM=0 keeps the old lazy behavior."""
+    if os.getenv("VOICE_WARM", "1") != "1":
+        return
+
+    async def run():
+        for name, step in (("whisper", get_whisper), ("kokoro", get_kokoro)):
+            t0 = time.time()
+            try:
+                await step()
+                logger.info("[WARM] %s ready in %ds", name, int(time.time() - t0))
+            except Exception as e:  # noqa: BLE001
+                logger.warning("[WARM] %s failed: %s", name, e)
+        if _is_clone(DEFAULT_VOICE):
+            t0 = time.time()
+            wav = await _clone_wav("Ready.", DEFAULT_VOICE)
+            logger.info("[WARM] clone %s in %ds", "ready" if wav else "unavailable, Kokoro speaks", int(time.time() - t0))
+
+    asyncio.ensure_future(run())
+
+
 @app.websocket("/v1/audio/stream")
 async def audio_stream(ws: WebSocket):
     """Binary frames in: 16 kHz mono PCM16, any size (re-framed to 80 ms).
