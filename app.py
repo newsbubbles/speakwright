@@ -8,6 +8,7 @@ Bound to 127.0.0.1 only. No API key required.
 
 Endpoints (OpenAI-compatible):
   POST /v1/audio/transcriptions   (multipart 'file' [+ 'model'])     -> { text }
+       + response_format=verbose_json -> { text, duration, words: [{word, start, end, probability}] }
   POST /v1/audio/speech           ({ input, voice?, response_format? }) -> audio bytes
 Also keeps the legacy /transcribe and /tts for backward compat.
 """
@@ -193,7 +194,9 @@ async def voice_ready_text(text: str) -> str:
         return baseline
 
 
-async def _transcribe_bytes(content: bytes, filename: str) -> str:
+async def _transcribe_bytes(content: bytes, filename: str, words: bool = False):
+    """The text, or with words=True {text, duration, words: [{word, start, end, probability}]} (seconds into the
+    audio, as whisper places them: a phrase's first word can start in the silence before it)."""
     suffix = Path(filename or "rec.webm").suffix or ".webm"
     tmp_path = None
     try:
@@ -203,8 +206,13 @@ async def _transcribe_bytes(content: bytes, filename: str) -> str:
         model = await get_whisper()
 
         def _run():
-            segments, _info = model.transcribe(tmp_path, beam_size=5)
-            return "".join(seg.text for seg in segments).strip()
+            segments, info = model.transcribe(tmp_path, beam_size=5, word_timestamps=words)
+            if not words:
+                return "".join(seg.text for seg in segments).strip()
+            segs = list(segments)
+            return {"text": "".join(seg.text for seg in segs).strip(), "duration": round(info.duration, 3),
+                    "words": [{"word": w.word.strip(), "start": round(w.start, 3), "end": round(w.end, 3),
+                               "probability": round(w.probability, 3)} for seg in segs for w in (seg.words or [])]}
 
         return await asyncio.get_event_loop().run_in_executor(None, _run)
     finally:
@@ -471,10 +479,15 @@ async def health():
 
 # ---- OpenAI-compatible endpoints ----------------------------------------------
 @app.post("/v1/audio/transcriptions")
-async def openai_transcriptions(file: UploadFile = File(...), model: str = Form(None)):
+async def openai_transcriptions(file: UploadFile = File(...), model: str = Form(None),
+                                response_format: str = Form(None)):
     start = time.time()
     content = await file.read()
     try:
+        if response_format == "verbose_json":
+            out = await _transcribe_bytes(content, file.filename or "rec.webm", words=True)
+            logger.info("[STT] %dms, %d words: %s", int((time.time() - start) * 1000), len(out["words"]), out["text"][:80])
+            return out
         text = await _transcribe_bytes(content, file.filename or "rec.webm")
         logger.info("[STT] %dms: %s", int((time.time() - start) * 1000), text[:80])
         return {"text": text}
