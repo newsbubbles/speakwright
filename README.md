@@ -49,7 +49,11 @@ All optional, see [`.env.example`](.env.example). Set via environment variables:
 | `VOICE_PORT` | `8765` | Listen port |
 | `VOICE_WARM` | `1` | Load whisper, Kokoro and the clone at startup instead of on the first request |
 | `WHISPER_MODEL_SIZE` | `base` | `tiny`/`base`/`small`/`medium`/`large-v3` |
-| `WHISPER_DEVICE` | `cpu` | `cpu` (int8) or `cuda` (float16) |
+| `WHISPER_DEVICE` | `cpu` | `cpu` (int8) or `cuda`: float16 where the card has it, else int8_float32 (Pascal, GTX 10xx), else float32 |
+| `WHISPER_COMPUTE` | _(unset)_ | Force a CTranslate2 compute type, tried first |
+| `VOICE_IDLE_UNLOAD_S` | `600` | After this long unused, whisper drops its GPU weights (about 2 s back), Kokoro moves to CPU RAM (about 0.5 s back) and Parakeet is dropped (about 9 s back). An open `/v1/audio/stream` ear pins them. `0` turns it off |
+| `STT_ENGINE` | `whisper` | Default speech-to-text engine for files: `whisper` or `parakeet`. A request picks one with `model=parakeet` or `model=whisper`; `whisper-1` gets the default. The ear always uses whisper |
+| `PARAKEET_MODEL` / `PARAKEET_THREADS` | `nemo-parakeet-tdt-0.6b-v2` / `2` | Parakeet via onnx-asr, int8 on the CPU (`uv pip install --no-deps onnx-asr`; the 631 MB model downloads on first use) |
 | `KOKORO_VOICE` | `af_heart` | Kokoro voice, and the fallback when a cloned voice cannot speak |
 | `DEFAULT_VOICE` | `KOKORO_VOICE` | Voice used when a request names none; set it to a clip name to speak in that voice |
 | `VOICE_CLONE_URL` | `http://127.0.0.1:8766` | Where clone.py listens |

@@ -12,3 +12,5 @@ openai>=1.40.0
 openwakeword>=0.6.0
 scipy
 scikit-learn
+# optional, for model=parakeet (Parakeet TDT 0.6B v2 on the CPU): onnx-asr, installed with --no-deps so it
+# leaves onnxruntime and numpy as they are: uv pip install --python .venv/Scripts/python.exe --no-deps onnx-asr
