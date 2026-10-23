@@ -1,0 +1,11 @@
+# The cloned voice (clone.py) lives in its own venv: Chatterbox-Turbo pins
+# an older torch than the rest of the sidecar.
+#
+#   uv venv --python 3.11 .venv-clone
+#   uv pip install --python .venv-clone --index-url https://download.pytorch.org/whl/cu126 "torch==2.6.0" "torchaudio==2.6.0"
+#   uv pip install --python .venv-clone -r requirements-clone.txt
+chatterbox-tts>=0.1.7
+setuptools<81             # resemble-perth imports pkg_resources, gone from newer setuptools
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+soundfile>=0.12.1

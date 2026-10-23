@@ -8,3 +8,7 @@ misaki[en]>=0.9.4
 soundfile>=0.12.1
 numpy>=1.26.0
 openai>=1.40.0
+# the ear (wake word + VAD): install with --no-deps so it cannot swap the CUDA torch
+openwakeword>=0.6.0
+scipy
+scikit-learn

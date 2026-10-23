@@ -9,3 +9,8 @@ __pycache__/
 # Generated audio / caches
 voice_messages/
 *.wav
+
+# The cloned voice: its own venv and its weights (see clone.py)
+.venv-clone/
+.hf/
+*.log
